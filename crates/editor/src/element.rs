@@ -56,7 +56,7 @@ use language::{IndentGuideSettings, language_settings::ShowWhitespaceSetting};
 use markdown::Markdown;
 use multi_buffer::{
     Anchor, ExcerptId, ExcerptInfo, ExpandExcerptDirection, ExpandInfo, MultiBufferPoint,
-    MultiBufferRow, RowInfo, ToOffset,
+    MultiBufferRow, RowInfo, ToOffset, MultiBufferOffset,
 };
 
 use crate::ScrollbarDirtyState;
@@ -7270,7 +7270,7 @@ impl EditorElement {
                 Some(
                     cx.spawn_in(window, async move |editor, cx| {
                         let scrollbar_size = scrollbar_layout.hitbox.size;
-                        let (buffer_markers, scope_markers) = cx
+                        let (buffer_markers, scope_markers, last_scope_range) = cx
                             .background_spawn(async move {
                                 let max_point =
                                     snapshot.display_snapshot.buffer_snapshot().max_point();
@@ -7454,10 +7454,9 @@ impl EditorElement {
                                 }
                                 
                                 let mut scope_quads: Vec<PaintQuad> = Vec::new();
+                                let mut new_scope_range: Option<Range<MultiBufferOffset>> = None;
                                 if scrollbar_settings.active_scope_markers {
-                                    if let Some((start_row, end_row)) =
-                                        Editor::current_scope_boundary(&snapshot, cursor_offset)
-                                    {
+                                    if let Some((start_row, end_row, inner_range)) =Editor::current_scope_boundary(&snapshot, cursor_offset) {
                                         let color = theme.colors().scrollbar_active_scope_marker;
                                         let scope_ranges = vec![
                                             ColoredRange {
@@ -7475,10 +7474,11 @@ impl EditorElement {
                                             scrollbar_layout
                                                 .marker_quads_for_ranges(scope_ranges, Some(2)),
                                         );
+                                        new_scope_range = Some(inner_range);
                                     }
                                 }
 
-                                (Arc::from(buffer_quads), Arc::from(scope_quads))
+                                (Arc::from(buffer_quads), Arc::from(scope_quads), new_scope_range)
                             })
                             .await;
 
@@ -7486,10 +7486,12 @@ impl EditorElement {
                             match dirty_reason {
                                 ScrollbarDirtyState::CursorMoved => {
                                     editor.scrollbar_marker_state.scope_markers = scope_markers;
+                                    editor.scrollbar_marker_state.last_scope_range = last_scope_range;
                                 }
                                 ScrollbarDirtyState::BufferChanged => {
                                     editor.scrollbar_marker_state.buffer_markers = buffer_markers;
                                     editor.scrollbar_marker_state.scope_markers = scope_markers;
+                                    editor.scrollbar_marker_state.last_scope_range = last_scope_range;
                                 }
                                 ScrollbarDirtyState::Clean => {}
                             }

@@ -750,6 +750,7 @@ struct ScrollbarMarkerState {
     buffer_markers: Arc<[PaintQuad]>,
     scope_markers: Arc<[PaintQuad]>,
     pending_refresh: Option<Task<Result<()>>>,
+    last_scope_range: Option<Range<MultiBufferOffset>>,
 }
 
 impl ScrollbarMarkerState {
@@ -3517,8 +3518,15 @@ impl Editor {
             self.refresh_document_highlights(cx);
             refresh_linked_ranges(self, window, cx);
 
+            // Only mark the scrollbar state as dirty if the cursor moved out of the last known scope range 
             if self.scrollbar_marker_state.dirty == ScrollbarDirtyState::Clean {
-                self.scrollbar_marker_state.dirty = ScrollbarDirtyState::CursorMoved;
+                let new_offset = new_cursor_position.to_offset(buffer);
+                let still_in_scope = self.scrollbar_marker_state.last_scope_range.as_ref().map_or(false, |r| r.contains(&new_offset));
+            
+                if !still_in_scope {
+                    self.scrollbar_marker_state.dirty = ScrollbarDirtyState::CursorMoved;
+                }
+                // If still_in_scope: scope rows are unchanged, skip the background task entirely.
             }
             
             self.refresh_selected_text_highlights(false, window, cx);
@@ -3761,15 +3769,19 @@ impl Editor {
         result
     }
     
-    // Returns the start and end row of the current scope the cursor is in, if any
+    // Returns the start and end row of the current scope the cursor is in
     pub fn current_scope_boundary(
         snapshot: &EditorSnapshot,
         cursor_offset: MultiBufferOffset,
-    ) -> Option<(DisplayRow, DisplayRow)> {
+    ) -> Option<(DisplayRow, DisplayRow, Range<MultiBufferOffset>)> {
         let buffer_snapshot = snapshot.buffer_snapshot();
+    
         let (open_range, close_range) = buffer_snapshot
             .enclosing_bracket_ranges(cursor_offset..cursor_offset)?
-            .last()?;
+            .min_by_key(|(o, c)| c.end.0.saturating_sub(o.start.0))?;
+    
+        let inner_range = open_range.end..close_range.start;
+    
         let start_row = buffer_snapshot
             .anchor_before(open_range.start.to_point(&buffer_snapshot))
             .to_display_point(&snapshot.display_snapshot)
@@ -3778,7 +3790,7 @@ impl Editor {
             .anchor_before(close_range.start.to_point(&buffer_snapshot))
             .to_display_point(&snapshot.display_snapshot)
             .row();
-        Some((start_row, end_row))
+        Some((start_row, end_row, inner_range))
     }
 
     /// Defers the effects of selection change, so that the effects of multiple calls to
@@ -19985,6 +19997,7 @@ impl Editor {
         cx.notify();
 
         self.scrollbar_marker_state.dirty = ScrollbarDirtyState::BufferChanged;
+        self.scrollbar_marker_state.last_scope_range = None;
         self.folds_did_change(cx);
     }
 
@@ -20095,6 +20108,7 @@ impl Editor {
 
         cx.notify();
         self.scrollbar_marker_state.dirty = ScrollbarDirtyState::BufferChanged;
+        self.scrollbar_marker_state.last_scope_range = None;
         self.active_indent_guides_state.dirty = true;
     }
 
@@ -22936,6 +22950,7 @@ impl Editor {
             (Arc::new(color_fetcher), Arc::from(ranges)),
         );
         self.scrollbar_marker_state.dirty = ScrollbarDirtyState::BufferChanged;
+        self.scrollbar_marker_state.last_scope_range = None;
         cx.notify();
     }
 
@@ -22951,6 +22966,7 @@ impl Editor {
             (Arc::new(color_fetcher), Arc::from(ranges)),
         );
         self.scrollbar_marker_state.dirty = ScrollbarDirtyState::BufferChanged;
+        self.scrollbar_marker_state.last_scope_range = None;
         cx.notify();
     }
 
@@ -22963,6 +22979,7 @@ impl Editor {
             .remove(&HighlightKey::Type(TypeId::of::<T>()))?;
         if !text_highlights.1.is_empty() {
             self.scrollbar_marker_state.dirty = ScrollbarDirtyState::BufferChanged;
+            self.scrollbar_marker_state.last_scope_range = None;
             cx.notify();
         }
         Some(text_highlights)
@@ -23450,6 +23467,7 @@ impl Editor {
         match event {
             multi_buffer::Event::Edited { edited_buffer } => {
                 self.scrollbar_marker_state.dirty = ScrollbarDirtyState::BufferChanged;
+                self.scrollbar_marker_state.last_scope_range = None;
                 self.active_indent_guides_state.dirty = true;
                 self.refresh_active_diagnostics(cx);
                 self.refresh_code_actions(window, cx);
@@ -23594,6 +23612,7 @@ impl Editor {
         self.refresh_active_diagnostics(cx);
         self.refresh_inline_diagnostics(true, window, cx);
         self.scrollbar_marker_state.dirty = ScrollbarDirtyState::BufferChanged;
+        self.scrollbar_marker_state.last_scope_range = None;
         cx.notify();
     }
 
