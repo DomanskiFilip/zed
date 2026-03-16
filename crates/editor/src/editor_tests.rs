@@ -31664,3 +31664,449 @@ async fn test_move_to_start_end_of_larger_syntax_node_with_selections_and_string
         );
     });
 }
+
+
+// the following tests test the state machine in selections_did_change and on_buffer_event
+ 
+// Moving the cursor must set CursorMoved, not BufferChanged
+
+// last_scope_range is cleared first so the range-suppression logic doesn't
+// mask the transition: if it contained a range covering the new cursor position
+// dirty would stay Clean and the test would pass for the wrong reason
+#[gpui::test]
+async fn test_cursor_move_sets_cursor_moved(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorTestContext::new(cx).await;
+ 
+    cx.set_state(indoc! {"
+        fn foo() {
+            ˇlet x = 1;
+            let y = 2;
+        }
+    "});
+ 
+    cx.update_editor(|editor, _, _| {
+        editor.scrollbar_marker_state.last_scope_range = None;
+        editor.scrollbar_marker_state.dirty = ScrollbarDirtyState::Clean;
+    });
+ 
+    cx.update_editor(|editor, window, cx| {
+        editor.move_down(&MoveDown, window, cx);
+    });
+ 
+    cx.update_editor(|editor, _, _| {
+        assert_eq!(
+            editor.scrollbar_marker_state.dirty,
+            ScrollbarDirtyState::CursorMoved,
+            "cursor movement must set CursorMoved.\n\
+             BufferChanged triggers a full git/diagnostic re-scan on every keystroke."
+        );
+    });
+}
+ 
+// A text edit must set BufferChanged
+#[gpui::test]
+async fn test_text_edit_sets_buffer_changed(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorTestContext::new(cx).await;
+ 
+    cx.set_state("ˇhello\n");
+ 
+    cx.update_editor(|editor, _, _| {
+        editor.scrollbar_marker_state.dirty = ScrollbarDirtyState::Clean;
+    });
+ 
+    cx.update_editor(|editor, window, cx| {
+        editor.handle_input("x", window, cx);
+    });
+ 
+    cx.update_editor(|editor, _, _| {
+        assert_eq!(
+            editor.scrollbar_marker_state.dirty,
+            ScrollbarDirtyState::BufferChanged,
+            "a text edit must set BufferChanged so git/diagnostic markers are recalculated.\n\
+             Seeing CursorMoved or Clean means scrollbar markers become permanently stale."
+        );
+    });
+}
+ 
+// Repeated cursor moves must stay at CursorMoved never escalating to BufferChanged
+#[gpui::test]
+async fn test_cursor_moves_do_not_escalate_to_buffer_changed(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorTestContext::new(cx).await;
+ 
+    cx.set_state(indoc! {"
+        fn foo() {
+            ˇlet x = 1;
+            let y = 2;
+            let z = 3;
+        }
+    "});
+ 
+    cx.update_editor(|editor, _, _| {
+        editor.scrollbar_marker_state.last_scope_range = None;
+        editor.scrollbar_marker_state.dirty = ScrollbarDirtyState::Clean;
+    });
+ 
+    cx.update_editor(|editor, window, cx| {
+        editor.move_down(&MoveDown, window, cx);
+        editor.move_down(&MoveDown, window, cx);
+        editor.move_down(&MoveDown, window, cx);
+    });
+ 
+    cx.update_editor(|editor, _, _| {
+        assert_eq!(
+            editor.scrollbar_marker_state.dirty,
+            ScrollbarDirtyState::CursorMoved,
+            "repeated cursor moves must stay at CursorMoved, not escalate to BufferChanged."
+        );
+    });
+}
+ 
+// A buffer edit must clear the scope cache (last_scope_range = None)
+#[gpui::test]
+async fn test_buffer_edit_clears_scope_cache(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorTestContext::new(cx).await;
+ 
+    cx.set_state(indoc! {"
+        fn foo() {
+            ˇlet x = 1;
+        }
+    "});
+ 
+    cx.update_editor(|editor, _, _| {
+        // Seed with a plausible range as if a background task had completed
+        editor.scrollbar_marker_state.last_scope_range =
+            Some(MultiBufferOffset(10)..MultiBufferOffset(50));
+    });
+ 
+    cx.update_editor(|editor, window, cx| {
+        editor.handle_input("x", window, cx);
+    });
+ 
+    cx.update_editor(|editor, _, _| {
+        assert!(
+            editor.scrollbar_marker_state.last_scope_range.is_none(),
+            "a buffer edit must clear last_scope_range.\n\
+             If it stays set the cache uses stale pre-edit byte offsets."
+        );
+    });
+}
+
+// EditorLspTestContext::new_rust required —> the cache check computes
+// current_scope_boundary which needs tree-sitter bracket data from a real
+// language grammar
+ 
+// Moving within a cached scope must NOT set CursorMoved
+#[gpui::test]
+async fn test_scope_cache_suppresses_cursor_moved_inside_scope(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorLspTestContext::new_rust(Default::default(), cx).await;
+ 
+    cx.set_state(indoc! {"
+        fn foo() {
+            ˇlet a = 1;
+            let b = 2;
+            let c = 3;
+        }
+    "});
+ 
+    cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        let cursor = editor
+            .selections
+            .newest_anchor()
+            .head()
+            .to_offset(&snapshot.buffer_snapshot());
+        let (_, _, inner_range) = Editor::current_scope_boundary(&snapshot, cursor)
+            .expect("test setup: cursor must be inside a bracket pair");
+        editor.scrollbar_marker_state.last_scope_range = Some(inner_range);
+        editor.scrollbar_marker_state.dirty = ScrollbarDirtyState::Clean;
+    });
+ 
+    cx.update_editor(|editor, window, cx| {
+        editor.move_down(&MoveDown, window, cx);
+    });
+ 
+    cx.update_editor(|editor, _, _| {
+        assert_eq!(
+            editor.scrollbar_marker_state.dirty,
+            ScrollbarDirtyState::Clean,
+            "cursor moving within the cached scope must NOT set CursorMoved.\n\
+             The last_scope_range suppression in selections_did_change was removed."
+        );
+    });
+}
+ 
+// Crossing a bracket boundary must set CursorMoved
+#[gpui::test]
+async fn test_scope_cache_fires_on_bracket_crossing(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorLspTestContext::new_rust(Default::default(), cx).await;
+ 
+    cx.set_state(indoc! {"
+        fn foo() {
+            if true {
+                ˇlet x = 1;
+            }
+            let y = 2;
+        }
+    "});
+ 
+    cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        let cursor = editor
+            .selections
+            .newest_anchor()
+            .head()
+            .to_offset(&snapshot.buffer_snapshot());
+        let (_, _, inner_range) = Editor::current_scope_boundary(&snapshot, cursor)
+            .expect("test setup: cursor must be inside the if-block");
+        editor.scrollbar_marker_state.last_scope_range = Some(inner_range);
+        editor.scrollbar_marker_state.dirty = ScrollbarDirtyState::Clean;
+    });
+ 
+    // Move past the closing `}` of the if-block into the outer fn scope
+    cx.update_editor(|editor, window, cx| {
+        editor.move_down(&MoveDown, window, cx);
+        editor.move_down(&MoveDown, window, cx);
+    });
+ 
+    cx.update_editor(|editor, _, _| {
+        assert_eq!(
+            editor.scrollbar_marker_state.dirty,
+            ScrollbarDirtyState::CursorMoved,
+            "crossing a bracket boundary must set CursorMoved so the new \
+             enclosing scope's tick-marks are computed."
+        );
+    });
+}
+
+// EditorLspTestContext::new_rust required — enclosing_bracket_ranges needs
+// tree-sitter bracket data
+ 
+// Single-line `{ … }` —> both tick-mark rows must be 0
+#[gpui::test]
+async fn test_scope_boundary_single_line(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorLspTestContext::new_rust(Default::default(), cx).await;
+ 
+    cx.set_state("fn foo() { ˇlet x = 1; }\n");
+ 
+    cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        let cursor = editor
+            .selections
+            .newest_anchor()
+            .head()
+            .to_offset(&snapshot.buffer_snapshot());
+ 
+        let (start, end, _) = Editor::current_scope_boundary(&snapshot, cursor)
+            .expect("cursor inside `{…}` must return Some");
+        assert_eq!(start, DisplayRow(0), "opening `{{` is on display row 0");
+        assert_eq!(end, DisplayRow(0), "closing `}}` is on display row 0");
+    });
+}
+ 
+// Multi-line function body —> correct rows for opening and closing brace
+#[gpui::test]
+async fn test_scope_boundary_multi_line(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorLspTestContext::new_rust(Default::default(), cx).await;
+ 
+    cx.set_state(indoc! {"
+        fn foo() {
+            let a = 1;
+            ˇlet b = 2;
+            let c = 3;
+        }
+    "});
+    // rows: 0=fn foo(){  1=let a  2=let b(cursor)  3=let c  4=}
+ 
+    cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        let cursor = editor
+            .selections
+            .newest_anchor()
+            .head()
+            .to_offset(&snapshot.buffer_snapshot());
+ 
+        let (start, end, _) = Editor::current_scope_boundary(&snapshot, cursor)
+            .expect("cursor inside multi-line `{{…}}` must return Some");
+        assert_eq!(start, DisplayRow(0), "opening brace is on row 0");
+        assert_eq!(end, DisplayRow(4), "closing brace is on row 4");
+    });
+}
+ 
+// Innermost scope must always be chosen regardless of nesting depth -> tests regression
+#[gpui::test]
+async fn test_scope_boundary_innermost_wins(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorLspTestContext::new_rust(Default::default(), cx).await;
+
+    for depth in [2, 5, 10] {
+        // Build:
+        //   fn f0() {
+        //       fn f1() {
+        //           ...
+        //               fn f{depth-1}() {
+        //                   let x = 1;  ← cursor
+        //               }
+        //           ...
+        //       }
+        //   }
+        let mut code = String::new();
+        for i in 0..depth {
+            code.push_str(&"    ".repeat(i));
+            code.push_str(&format!("fn f{i}() {{\n"));
+        }
+        code.push_str(&"    ".repeat(depth));
+        code.push_str("ˇlet x = 1;\n");
+        for i in (0..depth).rev() {
+            code.push_str(&"    ".repeat(i));
+            code.push_str("}\n");
+        }
+
+        cx.set_state(&code);
+
+        cx.update_editor(|editor, window, cx| {
+            let snapshot = editor.snapshot(window, cx);
+            let cursor = editor
+                .selections
+                .newest_anchor()
+                .head()
+                .to_offset(&snapshot.buffer_snapshot());
+
+            let (start, end, _) = Editor::current_scope_boundary(&snapshot, cursor)
+                .unwrap_or_else(|| panic!("depth {depth}: must return Some"));
+
+            // The innermost opening brace is on row depth-1,
+            // the cursor is on row depth,
+            // the innermost closing brace is on row depth+1.
+            let expected_start = DisplayRow((depth - 1) as u32);
+            let expected_end   = DisplayRow((depth + 1) as u32);
+
+            assert_eq!(
+                start, expected_start,
+                "depth {depth}: opening brace must be on row {}, not row 0 (outermost)",
+                depth - 1
+            );
+            assert_eq!(
+                end, expected_end,
+                "depth {depth}: closing brace must be on row {}, not row {} (outermost)",
+                depth + 1,
+                depth * 2
+            );
+        });
+    }
+}
+ 
+// Cursor at top level outside all brackets must return None without panicking
+#[gpui::test]
+async fn test_scope_boundary_none_outside_brackets(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorLspTestContext::new_rust(Default::default(), cx).await;
+ 
+    cx.set_state("ˇlet x = 1;\n");
+ 
+    cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        let cursor = editor
+            .selections
+            .newest_anchor()
+            .head()
+            .to_offset(&snapshot.buffer_snapshot());
+ 
+        assert!(
+            Editor::current_scope_boundary(&snapshot, cursor).is_none(),
+            "cursor at top level must return None, not panic"
+        );
+    });
+}
+ 
+// Cursor just inside the opening brace
+#[gpui::test]
+async fn test_scope_boundary_cursor_on_open_brace(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorLspTestContext::new_rust(Default::default(), cx).await;
+ 
+    cx.set_state(indoc! {"
+        fn foo() {ˇ
+            let x = 1;
+        }
+    "});
+ 
+    cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        let cursor = editor
+            .selections
+            .newest_anchor()
+            .head()
+            .to_offset(&snapshot.buffer_snapshot());
+ 
+        let (start, end, _) = Editor::current_scope_boundary(&snapshot, cursor)
+            .expect("cursor just inside opening brace must find the scope");
+        assert_eq!(start, DisplayRow(0), "opening brace is on row 0");
+        assert_eq!(end, DisplayRow(2), "closing brace is on row 2");
+    });
+}
+ 
+// Cursor just before the closing brace
+#[gpui::test]
+async fn test_scope_boundary_cursor_on_close_brace(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorLspTestContext::new_rust(Default::default(), cx).await;
+ 
+    cx.set_state(indoc! {"
+        fn foo() {
+            let x = 1;
+        ˇ}
+    "});
+ 
+    cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        let cursor = editor
+            .selections
+            .newest_anchor()
+            .head()
+            .to_offset(&snapshot.buffer_snapshot());
+ 
+        let (start, end, _) = Editor::current_scope_boundary(&snapshot, cursor)
+            .expect("cursor on closing-brace line must still find the scope");
+        assert_eq!(start, DisplayRow(0), "opening brace is on row 0");
+        assert_eq!(end, DisplayRow(2), "closing brace is on row 2");
+    });
+}
+ 
+// inner_range must contain the cursor offset
+#[gpui::test]
+async fn test_scope_boundary_inner_range_contains_cursor(cx: &mut gpui::TestAppContext) {
+    init_test(cx, |_| {});
+    let mut cx = EditorLspTestContext::new_rust(Default::default(), cx).await;
+ 
+    cx.set_state(indoc! {"
+        fn foo() {
+            ˇlet x = 1;
+        }
+    "});
+ 
+    cx.update_editor(|editor, window, cx| {
+        let snapshot = editor.snapshot(window, cx);
+        let cursor = editor
+            .selections
+            .newest_anchor()
+            .head()
+            .to_offset(&snapshot.buffer_snapshot());
+ 
+        let (_, _, inner_range) = Editor::current_scope_boundary(&snapshot, cursor)
+            .expect("cursor inside `{{…}}` must return Some");
+ 
+        assert!(
+            inner_range.contains(&cursor),
+            "inner_range {inner_range:?} must contain cursor {cursor:?}.\n\
+             If it does not, the scope cache never hits and the O(depth) optimisation is broken."
+        );
+    });
+}
