@@ -55,8 +55,8 @@ use itertools::Itertools;
 use language::{IndentGuideSettings, language_settings::ShowWhitespaceSetting};
 use markdown::Markdown;
 use multi_buffer::{
-    Anchor, ExcerptId, ExcerptInfo, ExpandExcerptDirection, ExpandInfo, MultiBufferPoint,
-    MultiBufferRow, RowInfo, ToOffset, MultiBufferOffset,
+    Anchor, ExcerptId, ExcerptInfo, ExpandExcerptDirection, ExpandInfo, MultiBufferOffset,
+    MultiBufferPoint, MultiBufferRow, RowInfo, ToOffset,
 };
 
 use crate::ScrollbarDirtyState;
@@ -7264,6 +7264,15 @@ impl EditorElement {
                 .newest_anchor()
                 .head()
                 .to_offset(&snapshot.buffer_snapshot());
+            // If there is no language or brackets detected skip current scope markers logic entirely
+            if dirty_reason == ScrollbarDirtyState::CursorMoved
+                && snapshot
+                    .language_scope_at(cursor_offset)
+                    .map_or(true, |s| s.brackets().all(|(_, enabled)| !enabled))
+            {
+                editor.scrollbar_marker_state.dirty = ScrollbarDirtyState::Clean;
+                return;
+            }
             let previous_scrollbar_size = editor.scrollbar_marker_state.scrollbar_size;
             editor.scrollbar_marker_state.dirty = ScrollbarDirtyState::Clean;
             editor.scrollbar_marker_state.pending_refresh =
@@ -7456,7 +7465,9 @@ impl EditorElement {
                                 let mut scope_quads: Vec<PaintQuad> = Vec::new();
                                 let mut new_scope_range: Option<Range<MultiBufferOffset>> = None;
                                 if scrollbar_settings.active_scope_markers {
-                                    if let Some((start_row, end_row, inner_range)) =Editor::current_scope_boundary(&snapshot, cursor_offset) {
+                                    if let Some((start_row, end_row, inner_range)) =
+                                        Editor::current_scope_boundary(&snapshot, cursor_offset)
+                                    {
                                         let color = theme.colors().scrollbar_active_scope_marker;
                                         let scope_ranges = vec![
                                             ColoredRange {
